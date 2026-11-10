@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>EncNote - Encrypted Notepad</title>
+<style>
+[hidden]{display:none!important}
+html,body{height:100%;margin:0}
+body{display:flex;flex-direction:column;background:#d4d0c8;font:12px Tahoma,"MS Sans Serif",Verdana,sans-serif;color:#000}
+.title{background:linear-gradient(90deg,#0a246a,#a6caf0);color:#fff;font-weight:bold;padding:3px 6px}
+.bar{display:flex;gap:2px;padding:4px;border-bottom:1px solid #808080;flex-wrap:wrap}
+button{font:inherit;background:#d4d0c8;border:2px outset #fff;padding:3px 10px;cursor:pointer;min-width:56px}
+button:active:not(:disabled){border-style:inset}
+button:disabled{color:#808080}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:1px dotted #000;outline-offset:-4px}
+.tb button{display:flex;flex-direction:column;align-items:center;min-width:64px}
+.tb i{font-style:normal;font-size:20px;line-height:24px}
+.addr{display:flex;gap:6px;align-items:center;padding:4px;border-bottom:1px solid #808080}
+.addr input{flex:1;border:2px inset #fff;background:#fff;padding:2px 4px;font:inherit}
+#st{font-weight:bold;min-width:70px;text-align:right}
+#t{flex:1;margin:4px;border:2px inset #fff;background:#fff;font:14px Consolas,"Courier New",monospace;padding:6px;resize:none;line-height:1.4}
+#t:disabled{background:#e8e6e0}
+.stat{display:flex;gap:12px;padding:3px 6px;border-top:1px solid #fff;align-items:center}
+#help{flex:1;min-width:0}
+.ov{position:fixed;inset:0;background:rgba(0,0,0,.35);display:flex;align-items:center;justify-content:center}
+.dlg{background:#d4d0c8;border:2px outset #fff;width:min(340px,92vw)}
+.dlg .title{display:block}
+.dlg .body{padding:10px;display:grid;gap:6px}
+.dlg input{border:2px inset #fff;padding:2px 4px;font:inherit}
+.dlg .row{display:flex;justify-content:flex-end;gap:6px;margin-top:4px}
+#err{color:#a00;min-height:1.2em}
+</style></head><body>
+<div class="title">EncNote - Encrypted Notepad (AES-256-GCM)</div>
+<div class="bar tb">
+<button id="bNew" data-help="New: start an empty note. You will choose a password when you save."><i>&#128196;</i>New</button>
+<button id="bOpen" data-help="Open: choose an .encnote file and decrypt it with your password (and keyfile, if used)."><i>&#128194;</i>Open</button>
+<button id="bSave" data-help="Save: encrypt the note and download it as an .encnote file. Ctrl+S"><i>&#128190;</i>Save</button>
+<button id="bLock" data-help="Lock: wipe the text and the key from memory right now. Ctrl+L"><i>&#128274;</i>Lock</button>
+<button id="bKey" data-help="Keyfile: pick any file as a second secret. Without that exact file the note cannot be opened."><i>&#128273;</i>Keyfile</button>
+<button id="bAbout" data-help="About: show the crypto settings used by this tool."><i>&#8505;</i>About</button>
+</div>
+<div class="addr"><span>File:</span><input id="fn" readonly><span id="st"></span></div>
+<textarea id="t" spellcheck="false" autocomplete="off" aria-label="Note text"></textarea>
+<div class="stat"><span id="help">Ready.</span><span id="ks"></span>
+<label>Auto-lock: <select id="al" data-help="Auto-lock: wipe everything after this much idle time. Unsaved changes are downloaded encrypted first.">
+<option value="1">1 min</option><option value="5" selected>5 min</option><option value="15">15 min</option><option value="30">30 min</option><option value="0">Never</option></select></label></div>
+<input type="file" id="fo" hidden><input type="file" id="fk" hidden>
+<div class="ov" id="dlg" hidden><div class="dlg" role="dialog" aria-modal="true"><div class="title">Enter password</div><div class="body">
+<label>Password:<br><input type="password" id="p1" autocomplete="off" style="width:95%"></label>
+<label id="cf">Confirm password:<br><input type="password" id="p2" autocomplete="off" style="width:95%"></label>
+<div id="err"></div><div class="row"><button id="ok">OK</button><button id="no">Cancel</button></div></div></div></div>
+<script>
+const $=id=>document.getElementById(id),enc=new TextEncoder(),dec=new TextDecoder();
+const ITER=1000000;
+let S=null,keyfile=null,open=false,dirty=false,fname='',timer;
+const b64=u=>{let s='';for(let i=0;i<u.length;i+=32768)s+=String.fromCharCode.apply(null,u.subarray(i,i+32768));return btoa(s)};
+const unb64=s=>Uint8Array.from(atob(s),c=>c.charCodeAt(0));
+const rnd=n=>crypto.getRandomValues(new Uint8Array(n));
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const say=m=>{$('help').textContent=m};
+const aad=(salt,iter)=>enc.encode('EncNote|1|PBKDF2-SHA512|'+iter+'|'+b64(salt));
+async function derive(pw,salt,iter){
+  const p=enc.encode(pw.normalize('NFKC'));let m=p;
+  if(keyfile){const h=new Uint8Array(await crypto.subtle.digest('SHA-256',keyfile));m=new Uint8Array(p.length+33);m.set(p);m.set(h,p.length+1)}
+  const base=await crypto.subtle.importKey('raw',m,'PBKDF2',false,['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2',hash:'SHA-512',salt,iterations:iter},base,{name:'AES-GCM',length:256},false,['encrypt','decrypt']);
+}
+function ui(){
+  const t=$('t');t.disabled=!open;
+  t.placeholder=open?'':'Locked. Click New to start a note, or Open to decrypt one.';
+  $('fn').value=fname||'(locked)';$('st').textContent=open?'UNLOCKED':'LOCKED';
+  $('ks').textContent='Keyfile: '+(keyfile?'loaded':'none');
+  $('bSave').disabled=$('bLock').disabled=!open;arm();
+}
+function arm(){clearTimeout(timer);const m=+$('al').value;if(open&&m)timer=setTimeout(auto,m*6e4)}
+async function auto(){if(!open)return;if(dirty&&S){try{await save()}catch(e){}}lock('Auto-locked after inactivity.')}
+function lock(msg){open=false;S=null;dirty=false;fname='';$('t').value='';ui();say(msg||'Locked. Text and key wiped from memory.')}
+function ask(again){return new Promise(res=>{
+  const d=$('dlg');ask.w=0;$('cf').hidden=!again;$('p1').value=$('p2').value=$('err').textContent='';d.hidden=false;$('p1').focus();
+  const done=v=>{d.hidden=true;$('p1').value=$('p2').value='';d.onkeydown=null;res(v)};
+  $('ok').onclick=()=>{const a=$('p1').value;
+    if(!a)return $('err').textContent='Enter a password.';
+    if(again){if(a!==$('p2').value)return $('err').textContent='Passwords do not match.';
+      if(a.length<12&&!ask.w){ask.w=1;return $('err').textContent='Under 12 characters is weak. Click OK again to use it anyway.'}}
+    done(a)};
+  $('no').onclick=()=>done(null);
+  d.onkeydown=e=>{if(e.key==='Enter')$('ok').click();if(e.key==='Escape')$('no').click()};
+})}
+async function save(){
+  if(!open)return;
+  if(!S){const pw=await ask(true);if(pw===null)return;say('Deriving key, please wait...');await sleep(30);
+    const salt=rnd(16);S={salt,iter:ITER,key:await derive(pw,salt,ITER)}}
+  const t=enc.encode($('t').value),n=Math.ceil((t.length+4)/1024)*1024,buf=new Uint8Array(n);
+  new DataView(buf.buffer).setUint32(0,t.length);buf.set(t,4);
+  const iv=rnd(12),ct=new Uint8Array(await crypto.subtle.encrypt({name:'AES-GCM',iv,additionalData:aad(S.salt,S.iter)},S.key,buf));
+  const out=JSON.stringify({app:'EncNote',v:1,kdf:'PBKDF2-SHA512',iter:S.iter,salt:b64(S.salt),iv:b64(iv),ct:b64(ct)});
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([out],{type:'application/json'}));
+  a.download=fname&&fname!=='(new)'?fname:'notes.encnote';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1e4);
+  dirty=false;fname=a.download;ui();say('Saved (encrypted) as '+a.download);
+}
+$('bNew').onclick=()=>{if(dirty&&!confirm('Discard unsaved changes?'))return;open=true;S=null;dirty=false;fname='(new)';$('t').value='';ui();$('t').focus();say('New note. You will set a password on Save.')};
+$('bOpen').onclick=()=>{if(dirty&&!confirm('Discard unsaved changes?'))return;$('fo').click()};
+$('fo').onchange=async e=>{
+  const f=e.target.files[0];e.target.value='';if(!f)return;
+  let j;try{j=JSON.parse(await f.text())}catch(x){}
+  if(!j||j.app!=='EncNote'||j.v!==1||j.kdf!=='PBKDF2-SHA512'||!(j.iter>=1e5&&j.iter<=1e8))return say('Not a valid EncNote file.');
+  const pw=await ask(false);if(pw===null)return;
+  say('Deriving key, please wait...');await sleep(30);
+  try{
+    const salt=unb64(j.salt),iv=unb64(j.iv),key=await derive(pw,salt,j.iter);
+    const pt=new Uint8Array(await crypto.subtle.decrypt({name:'AES-GCM',iv,additionalData:aad(salt,j.iter)},key,unb64(j.ct)));
+    const n=new DataView(pt.buffer).getUint32(0);
+    $('t').value=dec.decode(pt.subarray(4,4+n));S={salt,iter:j.iter,key};open=true;dirty=false;fname=f.name;ui();say('Decrypted '+f.name)
+  }catch(x){await sleep(1500);say('Cannot decrypt: wrong password, wrong keyfile, or the file was modified.')}
+};
+$('bSave').onclick=()=>save().catch(()=>say('Save failed.'));
+$('bLock').onclick=()=>{if(dirty&&!confirm('Unsaved changes will be lost. Lock anyway?'))return;lock()};
+$('bKey').onclick=()=>{if(keyfile){if(confirm('Remove the current keyfile?')){keyfile=null;S=null;ui();say('Keyfile removed.'+(open?' Next save asks for a password again.':''))}}else $('fk').click()};
+$('fk').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;keyfile=new Uint8Array(await f.arrayBuffer());S=null;ui();say('Keyfile loaded.'+(open?' Next save asks for a password again.':''))};
+$('bAbout').onclick=()=>alert('EncNote\nCipher: AES-256-GCM (random 96-bit IV per save)\nKDF: PBKDF2-HMAC-SHA512, 1,000,000 iterations, random 128-bit salt\nOptional keyfile (SHA-256) mixed into the key\nNo network access (blocked by Content-Security-Policy).\nSee README.md for the threat model.');
+$('t').oninput=()=>{dirty=true;arm()};
+$('al').onchange=arm;
+document.querySelectorAll('[data-help]').forEach(b=>{b.onmouseover=b.onfocus=()=>say(b.dataset.help)});
+['keydown','mousedown','mousemove'].forEach(ev=>document.addEventListener(ev,()=>{if(open)arm()}));
+document.addEventListener('keydown',e=>{if(!e.ctrlKey)return;const k=e.key.toLowerCase();
+  if(k==='s'){e.preventDefault();$('bSave').click()}if(k==='l'){e.preventDefault();$('bLock').click()}if(k==='o'){e.preventDefault();$('bOpen').click()}});
+window.onbeforeunload=e=>{if(dirty){e.preventDefault();e.returnValue=''}};
+ui();
+</script></body></html>
